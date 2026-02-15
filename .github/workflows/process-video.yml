@@ -1,0 +1,60 @@
+name: Process YouTube Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube URL to process'
+        required: true
+        type: string
+      job_id:
+        description: 'Job ID for tracking'
+        required: true
+        type: string
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install yt-dlp whispercpp ffmpeg-python openai
+
+      - name: Download video
+        run: |
+          python scripts/download.py "${{ github.event.inputs.youtube_url }}" ./video.mp4
+
+      - name: Transcribe with Whisper
+        run: |
+          python scripts/transcribe.py ./video.mp4 ./transcript.json
+
+      - name: Analyze interesting moments
+        run: |
+          python scripts/analyze.py ./transcript.json ./moments.json
+
+      - name: Process clips
+        run: |
+          mkdir -p ./clips
+          python scripts/process_clips.py ./video.mp4 ./moments.json ./clips/
+
+      - name: Generate captions
+        run: |
+          python scripts/generate_captions.py ./moments.json ./clips/captions.json
+
+      - name: Upload clips to R2/Supabase
+        run: |
+          python scripts/upload.py ./clips/ "${{ github.event.inputs.job_id }}"
+
+      - name: Update job status
+        run: |
+          echo "Job completed: ${{ github.event.inputs.job_id }}"
