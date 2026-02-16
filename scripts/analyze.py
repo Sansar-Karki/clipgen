@@ -3,6 +3,7 @@
 
 import json
 import re
+import sys
 from dataclasses import dataclass
 from typing import List
 
@@ -62,11 +63,37 @@ def has_emotional_language(text: str) -> bool:
     return False
 
 
-def calculate_volume_signal(segments: List[dict], start: float, end: float) -> int:
-    """Check for volume spikes in segment (simplified)"""
-    # In a real implementation, we'd analyze audio levels
-    # For now, return 0 as we don't have audio data
-    return 0
+def extract_key_words(text: str, num_words: int = 3) -> str:
+    """Extract the most engaging 2-3 words from text for short captions"""
+    if not text:
+        return ""
+    
+    skip_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because', 'until', 'while', 'this', 'that', 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'what', 'which', 'who', 'whom', 'you', 'your', 'i', 'me', 'my', 'we', 'us', 'our', 'he', 'him', 'his', 'she', 'her', 'get', 'got', 'going', 'go', 'like', 'know', 'think', 'really', 'thing', 'things', 'way', 'make', 'made', 'want', 'come', 'actually', 'basically', 'literally', 'honestly'}
+    priority_words = {'secret', 'truth', 'money', 'wealth', 'rich', 'success', 'failure', 'dream', 'goal', 'habit', 'life', 'hack', 'tip', 'tips', 'strategy', 'mindset', 'belief', 'fear', 'love', 'hate', 'amazing', 'incredible', 'shocking', 'warning', 'mistake', 'lesson', 'story', 'proven', 'tested', 'never', 'always', 'everyone', 'nobody', 'imagine', 'trust', 'real', 'honest', 'finally', 'best', 'worst', 'easy', 'simple', 'fast', 'quick', 'free', 'now', 'today', 'start', 'stop', 'watch', 'listen', 'remember', 'understand', 'learn', 'grow', 'change'}
+    
+    words = re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
+    scored_words = []
+    for word in words:
+        if word in skip_words:
+            continue
+        score = 1
+        if word in priority_words:
+            score += 3
+        if word in words[:5]:
+            score += 1
+        scored_words.append((word, score))
+    
+    scored_words.sort(key=lambda x: x[1], reverse=True)
+    top_words = [w[0] for w in scored_words[:num_words]]
+    
+    if len(top_words) < num_words:
+        for word in words:
+            if word not in skip_words and word not in top_words:
+                top_words.append(word)
+                if len(top_words) >= num_words:
+                    break
+    
+    return ' '.join(top_words[:num_words])
 
 
 def score_segment(segment_text: str, segment_audio: dict = None) -> dict:
@@ -134,20 +161,26 @@ def analyze_transcript(transcript_path: str, output_path: str):
             'signals': result['signals']
         })
     
-    # Sort by score and get top 5
+    # Sort by score and get top 20 (more clips)
     scored_windows.sort(key=lambda x: x['score'], reverse=True)
-    top_moments = [w for w in scored_windows if w['score'] >= 40][:5]
+    top_moments = [w for w in scored_windows if w["score"] >= 15][:20]
     
-    # Expand to 30-60 second clips around best moments
+    # Expand to max 45 second clips around best moments
     clips = []
     for moment in top_moments:
-        clip_start = max(0, moment['start'] - 10)
-        clip_end = min(moment['end'] + 20, scored_windows[-1]['end'])
+        clip_start = max(0, moment['start'] - 5)
+        clip_duration = min(45, moment['end'] - moment['start'] + 25)  # Max 45 seconds
+        clip_end = min(clip_start + clip_duration, scored_windows[-1]['end'])
+        
+        # Extract 2-3 key words from the text for caption
+        key_words = extract_key_words(moment['text'], num_words=3)
+        
         clips.append({
             'start': clip_start,
             'end': clip_end,
             'score': moment['score'],
-            'text': moment['text'],
+            'text': key_words,  # 2-3 words instead of full sentence
+            'full_text': moment['text'],  # Keep full text for reference
             'signals': moment['signals']
         })
     
@@ -163,7 +196,7 @@ def analyze_transcript(transcript_path: str, output_path: str):
     
     print(f"Found {len(clips)} interesting moments")
     for i, clip in enumerate(clips):
-        print(f"  {i+1}. {clip['start']:.1f}s - {clip['end']:.1f}s (score: {clip['score']})")
+        print(f"  {i+1}. {clip['start']:.1f}s - {clip['end']:.1f}s (score: {clip['score']}) - \"{clip['text']}\"")
 
 
 if __name__ == '__main__':

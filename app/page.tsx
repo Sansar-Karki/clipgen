@@ -17,6 +17,7 @@ interface Clip {
   caption: string
   hashtags: string
   storage_url: string
+  downloading?: boolean
 }
 
 export default function Home() {
@@ -28,9 +29,9 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false)
   const pollRef = useRef<NodeJS.Timeout | null>(null)
 
-  const startProcessing {
+  const startProcessing = async () => {
     if (!url.trim()) {
-      set = async () =>Error('Please enter a YouTube URL')
+      setError('Please enter a YouTube URL')
       return
     }
 
@@ -168,6 +169,51 @@ export default function Home() {
 
   const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+  const downloadClip = async (clip: Clip) => {
+    if (!url.trim()) {
+      setError('No video URL available')
+      return
+    }
+    
+    // Mark this clip as downloading
+    setClips(prev => prev.map(c => 
+      c.id === clip.id ? { ...c, downloading: true } : c
+    ))
+    
+    try {
+      const response = await fetch('/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoUrl: url,
+          startTime: clip.start_time,
+          endTime: clip.end_time,
+          clipId: clip.id
+        })
+      })
+      
+      if (!response.ok) throw new Error('Download failed')
+      
+      const data = await response.json()
+      
+      if (data.downloadUrl) {
+        // Create download link
+        const a = document.createElement('a')
+        a.href = data.downloadUrl
+        a.download = `clip_${clip.id}.mp4`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Download failed')
+    } finally {
+      setClips(prev => prev.map(c => 
+        c.id === clip.id ? { ...c, downloading: false } : c
+      ))
+    }
+  }
+
   useEffect(() => {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current)
@@ -252,7 +298,13 @@ export default function Home() {
                   <p className="clip-caption">{clip.caption}</p>
                   <p className="clip-hashtags">{clip.hashtags}</p>
                   <div className="clip-actions">
-                    <button className="clip-btn primary">Download</button>
+                    <button 
+                      className="clip-btn primary" 
+                      onClick={() => downloadClip(clip)}
+                      disabled={clip.downloading}
+                    >
+                      {clip.downloading ? '⏳ Downloading...' : 'Download'}
+                    </button>
                     <button className="clip-btn secondary">Copy</button>
                   </div>
                 </div>
