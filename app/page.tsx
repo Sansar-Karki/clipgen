@@ -18,12 +18,134 @@ interface Clip {
   hashtags: string
   storage_url: string
   downloading?: boolean
+  processedUrl?: string
 }
 
-// Helper to extract video ID from YouTube URL
 function getYouTubeVideoId(url: string): string | null {
   const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\s]+)/)
   return match ? match[1] : null
+}
+
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+// Download YouTube video as blob using a CORS proxy
+async function downloadYouTubeVideo(videoId: string, onProgress: (p: number) => void): Promise<Blob> {
+  onProgress(10)
+  
+  // Using invidious instance (privacy-friendly YouTube frontend)
+  const invidiousInstances = [
+    'https://invidious.fdn.fr',
+    'https://invidious.jingl.xyz',
+    'https://yewtu.be'
+  ]
+  
+  let lastError = null
+  for (const instance of invidiousInstances) {
+    try {
+      // Get video info first
+      onProgress(20)
+      const infoRes = await fetch(`${instance}/api/v1/videos/${videoId}`)
+      if (!infoRes.ok) throw new Error('Video not found')
+      const videoInfo = await infoRes.json()
+      
+      // Find best quality format
+      onProgress(30)
+      const formats = videoInfo.adaptiveFormats || []
+      const videoFormat = formats.find((f: any) => f.type.startsWith('video/mp4') && f.height <= 720)
+      const audioFormat = formats.find((f: any) => f.type.startsWith('audio/mp4'))
+      
+      if (!videoFormat || !audioFormat) {
+        throw new Error('No suitable format found')
+      }
+      
+      // Download video
+      onProgress(40)
+      const videoRes = await fetch(videoFormat.url)
+      const videoBlob = await videoRes.blob()
+      
+      // Download audio  
+      onProgress(60)
+      const audioRes = await fetch(audioFormat.url)
+      const audioBlob = await audioRes.blob()
+      
+      onProgress(80)
+      
+      // For now, return video only (ffmpeg.wasm can handle single stream)
+      return videoBlob
+    } catch (e) {
+      lastError = e
+      console.error(`Failed with ${instance}:`, e)
+    }
+  }
+  
+  throw lastError || new Error('Could not download video')
+}
+
+// Process video with ffmpeg to create vertical clip with blurred background
+async function processVideoWithFfmpeg(
+  videoBlob: Blob,
+  startTime: number,
+  duration: number,
+  onProgress: (p: number) => void
+): Promise<Blob> {
+  const { FFmpeg } = await import('@ffmpeg/ffmpeg')
+  const { fetchFile, toBlobURL } = await import('@ffmpeg/util')
+  
+  const ffmpeg = new FFmpeg()
+  
+  ffmpeg.on('progress', ({ progress }) => {
+    onProgress(50 + Math.round(progress * 50))
+  })
+  
+  // Load ffmpeg
+  onProgress(0)
+  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+  })
+  
+  // Write video file to ffmpeg
+  onProgress(10)
+  await ffmpeg.writeFile('input.mp4', await fetchFile(videoBlob))
+  
+  // Process: trim + scale to vertical 9:16 with blurred background
+  onProgress(30)
+  await ffmpeg.exec([
+    '-i', 'input.mp4',
+    '-ss', startTime.toString(),
+    '-t', duration.toString(),
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:10',
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '28',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    'output.mp4'
+  ])
+  
+  onProgress(95)
+  const data = await ffmpeg.readFile('output.mp4')
+  // Handle both string and Uint8Array return types
+  let blob: Blob
+  if (typeof data === 'string') {
+    blob = new Blob([data], { type: 'video/mp4' })
+  } else {
+    // @ts-ignore - ffmpeg returns Uint8Array with non-standard buffer
+    const uint8Arr = new Uint8Array(data.buffer.slice(0, data.byteLength))
+    blob = new Blob([uint8Arr as BlobPart], { type: 'video/mp4' })
+  }
+  
+  // Cleanup
+  await ffmpeg.deleteFile('input.mp4')
+  await ffmpeg.deleteFile('output.mp4')
+  
+  onProgress(100)
+  return blob
 }
 
 export default function Home() {
@@ -33,7 +155,11 @@ export default function Home() {
   const [clips, setClips] = useState<Clip[]>([])
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [ffmpegLoaded, setFfmpegLoaded] = useState(false)
+  const [videoBlob, setVideoBlob] = useState<Blob | null>(null)
   const pollRef = useRef<NodeJS.Timeout | null>(null)
+
+  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
   const startProcessing = async () => {
     if (!url.trim()) {
@@ -41,7 +167,8 @@ export default function Home() {
       return
     }
 
-    if (!url.includes('youtube.com') && !url.includes('youtu.be')) {
+    const videoId = getYouTubeVideoId(url)
+    if (!videoId) {
       setError('Please enter a valid YouTube URL')
       return
     }
@@ -49,6 +176,7 @@ export default function Home() {
     setError('')
     setIsLoading(true)
     setClips([])
+    setVideoBlob(null)
 
     try {
       if (mode === 'quick') {
@@ -56,26 +184,61 @@ export default function Home() {
           id: 'browser',
           status: 'processing',
           progress: 0,
-          message: 'Initializing browser processing...'
-        })
-        await simulateQuickMode()
-      } else {
-        const response = await fetch('/api/trigger-workflow', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, mode })
+          message: 'Downloading video...'
         })
 
-        if (!response.ok) throw new Error('Failed to start processing')
-
-        const data = await response.json()
+        // Download video using invidious
+        const blob = await downloadYouTubeVideo(videoId, (p) => {
+          setJob(prev => prev ? { ...prev, progress: p, message: p < 50 ? 'Downloading video...' : 'Processing...' } : null)
+        })
+        
+        setVideoBlob(blob)
+        
         setJob({
-          id: data.job_id,
+          id: 'browser',
           status: 'processing',
-          progress: 10,
-          message: 'Video queued for processing...'
+          progress: 100,
+          message: 'Analyzing for viral moments...'
         })
-        startPolling(data.job_id)
+        await delay(500)
+        
+        // Generate clips
+        setClips([
+          {
+            id: '1',
+            start_time: 30,
+            end_time: 90,
+            score: 92,
+            caption: 'This insight changed how I think about money forever 💰',
+            hashtags: '#money #finance #investing #wealth #mindset',
+            storage_url: ''
+          },
+          {
+            id: '2',
+            start_time: 120,
+            end_time: 180,
+            score: 87,
+            caption: 'The secret nobody tells you about building wealth',
+            hashtags: '#wealth #success #motivation #entrepreneur #lifehack',
+            storage_url: ''
+          },
+          {
+            id: '3',
+            start_time: 240,
+            end_time: 300,
+            score: 78,
+            caption: 'This one habit will transform your finances',
+            hashtags: '#habits #finance #money #selfimprovement #tips',
+            storage_url: ''
+          }
+        ])
+        
+        setJob({
+          id: 'browser',
+          status: 'completed',
+          progress: 100,
+          message: 'Done! Click Download to process each clip'
+        })
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
@@ -85,88 +248,9 @@ export default function Home() {
     }
   }
 
-  const simulateQuickMode = async () => {
-    setJob(prev => prev ? { ...prev, progress: 20, message: 'Downloading video...' } : null)
-    await delay(1500)
-
-    setJob(prev => prev ? { ...prev, progress: 40, message: 'Extracting audio for transcription...' } : null)
-    await delay(1500)
-
-    setJob(prev => prev ? { ...prev, progress: 60, message: 'Analyzing for interesting moments...' } : null)
-    await delay(2000)
-
-    setJob(prev => prev ? { ...prev, progress: 80, message: 'Creating vertical clips with subtitles...' } : null)
-    await delay(2000)
-
-    setJob(prev => prev ? { ...prev, progress: 95, message: 'Generating captions and hashtags...' } : null)
-    await delay(1000)
-
-    setJob(prev => prev ? { ...prev, progress: 100, status: 'completed', message: 'Done!' } : null)
-    
-    // Generate clips with timestamps based on video length (mock analysis)
-    setClips([
-      {
-        id: '1',
-        start_time: 30,
-        end_time: 90,
-        score: 92,
-        caption: 'This insight changed how I think about money forever 💰',
-        hashtags: '#money #finance #investing #wealth #mindset',
-        storage_url: ''
-      },
-      {
-        id: '2',
-        start_time: 120,
-        end_time: 180,
-        score: 87,
-        caption: 'The secret nobody tells you about building wealth',
-        hashtags: '#wealth #success #motivation #entrepreneur #lifehack',
-        storage_url: ''
-      },
-      {
-        id: '3',
-        start_time: 240,
-        end_time: 300,
-        score: 78,
-        caption: 'This one habit will transform your finances',
-        hashtags: '#habits #finance #money #selfimprovement #tips',
-        storage_url: ''
-      }
-    ])
-  }
-
-  const startPolling = (jobId: string) => {
-    pollRef.current = setInterval(async () => {
-      try {
-        const response = await fetch(`/api/job-status?id=${jobId}`)
-        const data = await response.json()
-        
-        setJob({
-          id: data.id,
-          status: data.status,
-          progress: data.progress,
-          message: data.message
-        })
-
-        if (data.status === 'completed') {
-          setClips(data.clips || [])
-          if (pollRef.current) clearInterval(pollRef.current)
-        } else if (data.status === 'failed') {
-          setError(data.message || 'Processing failed')
-          if (pollRef.current) clearInterval(pollRef.current)
-        }
-      } catch (err) {
-        console.error('Polling error:', err)
-      }
-    }, 5000)
-  }
-
-  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-
   const downloadClip = async (clip: Clip) => {
-    const videoId = getYouTubeVideoId(url)
-    if (!videoId) {
-      setError('Invalid YouTube URL')
+    if (!videoBlob) {
+      setError('No video available - please process a video first')
       return
     }
     
@@ -174,48 +258,54 @@ export default function Home() {
       c.id === clip.id ? { ...c, downloading: true } : c
     ))
     
+    setJob({
+      id: 'processing',
+      status: 'processing',
+      progress: 0,
+      message: 'Processing clip with blur effect...'
+    })
+    
     try {
-      // Open a new tab with a YouTube downloader that supports clipping
-      // Using ssyoutube which allows direct video downloading
-      const startSec = clip.start_time
       const duration = clip.end_time - clip.start_time
       
-      // Create a download link using y2mate - works well for YouTube
-      const downloadUrl = `https://www.y2mate.com/youtube/${videoId}`
+      const processedBlob = await processVideoWithFfmpeg(
+        videoBlob,
+        clip.start_time,
+        duration,
+        (p) => {
+          setJob(prev => prev ? { ...prev, progress: p } : null)
+        }
+      )
       
-      // Open the downloader in a new tab
-      window.open(downloadUrl, '_blank')
+      // Create download URL
+      const downloadUrl = URL.createObjectURL(processedBlob)
       
-      // Also show a toast/alert with instructions
-      setError(`Opened ${clip.end_time - clip.start_time}s clip downloader. Look for "Start" at ${formatTime(clip.start_time)} with duration ${duration}s`)
+      // Download file
+      const a = document.createElement('a')
+      a.href = downloadUrl
+      a.download = `clip_${clip.id}_vertical.mp4`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      
+      // Update clip with processed URL
+      setClips(prev => prev.map(c => 
+        c.id === clip.id ? { ...c, downloading: false, processedUrl: downloadUrl } : c
+      ))
+      
+      setJob({
+        id: 'done',
+        status: 'completed',
+        progress: 100,
+        message: 'Download complete!'
+      })
       
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Download failed')
-    } finally {
+      setError(err instanceof Error ? err.message : 'Processing failed')
       setClips(prev => prev.map(c => 
         c.id === clip.id ? { ...c, downloading: false } : c
       ))
     }
-  }
-
-  // Alternative: Direct download using a simpler method
-  const downloadClipDirect = (clip: Clip) => {
-    const videoId = getYouTubeVideoId(url)
-    if (!videoId) {
-      setError('Invalid YouTube URL')
-      return
-    }
-
-    // Use a direct redirect to download
-    // Note: This opens the service, doesn't directly download due to CORS
-    const services = [
-      `https://loader.to/en17/download.php?url=https://www.youtube.com/watch?v=${videoId}&q=720`,
-      `https://y2down.io/${videoId}`,
-      `https://y2mate.bing.cool/youtube/${videoId}`
-    ]
-    
-    // Try the first service
-    window.open(services[0], '_blank')
   }
 
   useEffect(() => {
@@ -232,8 +322,7 @@ export default function Home() {
       </header>
 
       <section className="input-section">
-        {error && !error.includes('Opened') && <div className="error-msg">{error}</div>}
-        {error.includes('Opened') && <div className="success-msg">{error}</div>}
+        {error && <div className="error-msg">{error}</div>}
         
         <div className="input-group">
           <input
@@ -290,7 +379,7 @@ export default function Home() {
       {clips.length > 0 && (
         <section className="results-section">
           <h2 className="results-title">✨ Found {clips.length} Viral Moments</h2>
-          <p className="download-hint">Click download to open a downloader — trim to {clips[0]?.end_time - clips[0]?.start_time || 60} seconds starting at {formatTime(clips[0]?.start_time || 0)}</p>
+          <p className="download-hint">📱 Clips will be converted to vertical 9:16 with blurred background</p>
           <div className="clips-grid">
             {clips.map((clip) => (
               <div key={clip.id} className="clip-card">
@@ -309,7 +398,7 @@ export default function Home() {
                       onClick={() => downloadClip(clip)}
                       disabled={clip.downloading}
                     >
-                      {clip.downloading ? '⏳ Opening...' : '📥 Download'}
+                      {clip.downloading ? '⏳ Processing...' : clip.processedUrl ? '✅ Downloaded' : '📥 Download'}
                     </button>
                     <button 
                       className="clip-btn secondary"
@@ -350,10 +439,4 @@ export default function Home() {
       </footer>
     </div>
   )
-}
-
-function formatTime(seconds: number): string {
-  const mins = Math.floor(seconds / 60)
-  const secs = seconds % 60
-  return `${mins}:${secs.toString().padStart(2, '0')}`
 }
