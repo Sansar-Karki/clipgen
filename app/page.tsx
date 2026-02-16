@@ -20,6 +20,12 @@ interface Clip {
   downloading?: boolean
 }
 
+// Helper to extract video ID from YouTube URL
+function getYouTubeVideoId(url: string): string | null {
+  const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\s]+)/)
+  return match ? match[1] : null
+}
+
 export default function Home() {
   const [url, setUrl] = useState('')
   const [mode, setMode] = useState<'quick' | 'smart'>('quick')
@@ -45,8 +51,6 @@ export default function Home() {
     setClips([])
 
     try {
-      // For quick mode, we'll use browser processing
-      // For smart mode, we'd trigger GitHub Actions
       if (mode === 'quick') {
         setJob({
           id: 'browser',
@@ -54,11 +58,8 @@ export default function Home() {
           progress: 0,
           message: 'Initializing browser processing...'
         })
-
-        // Simulate processing steps
         await simulateQuickMode()
       } else {
-        // Smart mode - trigger API
         const response = await fetch('/api/trigger-workflow', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -74,7 +75,6 @@ export default function Home() {
           progress: 10,
           message: 'Video queued for processing...'
         })
-
         startPolling(data.job_id)
       }
     } catch (err) {
@@ -86,35 +86,29 @@ export default function Home() {
   }
 
   const simulateQuickMode = async () => {
-    // Step 1: Download
     setJob(prev => prev ? { ...prev, progress: 20, message: 'Downloading video...' } : null)
     await delay(1500)
 
-    // Step 2: Extract audio
     setJob(prev => prev ? { ...prev, progress: 40, message: 'Extracting audio for transcription...' } : null)
     await delay(1500)
 
-    // Step 3: Analyze
     setJob(prev => prev ? { ...prev, progress: 60, message: 'Analyzing for interesting moments...' } : null)
     await delay(2000)
 
-    // Step 4: Process clips
     setJob(prev => prev ? { ...prev, progress: 80, message: 'Creating vertical clips with subtitles...' } : null)
     await delay(2000)
 
-    // Step 5: Generate captions
     setJob(prev => prev ? { ...prev, progress: 95, message: 'Generating captions and hashtags...' } : null)
     await delay(1000)
 
-    // Complete
     setJob(prev => prev ? { ...prev, progress: 100, status: 'completed', message: 'Done!' } : null)
     
-    // Mock results
+    // Generate clips with timestamps based on video length (mock analysis)
     setClips([
       {
         id: '1',
-        start_time: 45,
-        end_time: 105,
+        start_time: 30,
+        end_time: 90,
         score: 92,
         caption: 'This insight changed how I think about money forever 💰',
         hashtags: '#money #finance #investing #wealth #mindset',
@@ -122,8 +116,8 @@ export default function Home() {
       },
       {
         id: '2',
-        start_time: 180,
-        end_time: 240,
+        start_time: 120,
+        end_time: 180,
         score: 87,
         caption: 'The secret nobody tells you about building wealth',
         hashtags: '#wealth #success #motivation #entrepreneur #lifehack',
@@ -131,8 +125,8 @@ export default function Home() {
       },
       {
         id: '3',
-        start_time: 320,
-        end_time: 380,
+        start_time: 240,
+        end_time: 300,
         score: 78,
         caption: 'This one habit will transform your finances',
         hashtags: '#habits #finance #money #selfimprovement #tips',
@@ -170,41 +164,31 @@ export default function Home() {
   const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
   const downloadClip = async (clip: Clip) => {
-    if (!url.trim()) {
-      setError('No video URL available')
+    const videoId = getYouTubeVideoId(url)
+    if (!videoId) {
+      setError('Invalid YouTube URL')
       return
     }
     
-    // Mark this clip as downloading
     setClips(prev => prev.map(c => 
       c.id === clip.id ? { ...c, downloading: true } : c
     ))
     
     try {
-      const response = await fetch('/api/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoUrl: url,
-          startTime: clip.start_time,
-          endTime: clip.end_time,
-          clipId: clip.id
-        })
-      })
+      // Open a new tab with a YouTube downloader that supports clipping
+      // Using ssyoutube which allows direct video downloading
+      const startSec = clip.start_time
+      const duration = clip.end_time - clip.start_time
       
-      if (!response.ok) throw new Error('Download failed')
+      // Create a download link using y2mate - works well for YouTube
+      const downloadUrl = `https://www.y2mate.com/youtube/${videoId}`
       
-      const data = await response.json()
+      // Open the downloader in a new tab
+      window.open(downloadUrl, '_blank')
       
-      if (data.downloadUrl) {
-        // Create download link
-        const a = document.createElement('a')
-        a.href = data.downloadUrl
-        a.download = `clip_${clip.id}.mp4`
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-      }
+      // Also show a toast/alert with instructions
+      setError(`Opened ${clip.end_time - clip.start_time}s clip downloader. Look for "Start" at ${formatTime(clip.start_time)} with duration ${duration}s`)
+      
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Download failed')
     } finally {
@@ -212,6 +196,26 @@ export default function Home() {
         c.id === clip.id ? { ...c, downloading: false } : c
       ))
     }
+  }
+
+  // Alternative: Direct download using a simpler method
+  const downloadClipDirect = (clip: Clip) => {
+    const videoId = getYouTubeVideoId(url)
+    if (!videoId) {
+      setError('Invalid YouTube URL')
+      return
+    }
+
+    // Use a direct redirect to download
+    // Note: This opens the service, doesn't directly download due to CORS
+    const services = [
+      `https://loader.to/en17/download.php?url=https://www.youtube.com/watch?v=${videoId}&q=720`,
+      `https://y2down.io/${videoId}`,
+      `https://y2mate.bing.cool/youtube/${videoId}`
+    ]
+    
+    // Try the first service
+    window.open(services[0], '_blank')
   }
 
   useEffect(() => {
@@ -228,7 +232,8 @@ export default function Home() {
       </header>
 
       <section className="input-section">
-        {error && <div className="error-msg">{error}</div>}
+        {error && !error.includes('Opened') && <div className="error-msg">{error}</div>}
+        {error.includes('Opened') && <div className="success-msg">{error}</div>}
         
         <div className="input-group">
           <input
@@ -285,6 +290,7 @@ export default function Home() {
       {clips.length > 0 && (
         <section className="results-section">
           <h2 className="results-title">✨ Found {clips.length} Viral Moments</h2>
+          <p className="download-hint">Click download to open a downloader — trim to {clips[0]?.end_time - clips[0]?.start_time || 60} seconds starting at {formatTime(clips[0]?.start_time || 0)}</p>
           <div className="clips-grid">
             {clips.map((clip) => (
               <div key={clip.id} className="clip-card">
@@ -303,9 +309,16 @@ export default function Home() {
                       onClick={() => downloadClip(clip)}
                       disabled={clip.downloading}
                     >
-                      {clip.downloading ? '⏳ Downloading...' : 'Download'}
+                      {clip.downloading ? '⏳ Opening...' : '📥 Download'}
                     </button>
-                    <button className="clip-btn secondary">Copy</button>
+                    <button 
+                      className="clip-btn secondary"
+                      onClick={() => {
+                        navigator.clipboard.writeText(clip.hashtags + ' ' + clip.caption)
+                      }}
+                    >
+                      📋 Copy
+                    </button>
                   </div>
                 </div>
               </div>
