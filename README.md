@@ -1,5 +1,7 @@
 # ClipGen - Free YouTube Clip Generator
 
+> **Use it on your own videos, or videos you have permission to use.** It downloads YouTube videos with yt-dlp, which can go against YouTube's terms and other people's copyright. This is an early prototype from February 2026 and is not maintained.
+
 A 100% free YouTube clip generation tool that finds interesting moments, creates vertical (9:16) clips with blurred backgrounds and subtitles, and generates captions/hashtags.
 
 ## Features
